@@ -1,0 +1,311 @@
+# cicd/buildspec-frontend.yml
+version: 0.2
+
+phases:
+  pre_build:
+    commands:
+      - echo Logging in to Amazon ECR...
+      - aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REPO_URL
+      - COMMIT_HASH=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7)
+      - IMAGE_TAG=${COMMIT_HASH:=latest}
+  build:
+    commands:
+      - echo Building the Docker image...
+      - cd frontend
+      - docker build -t $ECR_REPO_URL/diet-app-frontend:$IMAGE_TAG -t $ECR_REPO_URL/diet-app-frontend:latest .
+  post_build:
+    commands:
+      - echo Pushing the Docker image...
+      - docker push $ECR_REPO_URL/diet-app-frontend:$IMAGE_TAG
+      - docker push $ECR_REPO_URL/diet-app-frontend:latest
+      - echo Writing image definition file...
+      - cd ..
+      - aws eks update-kubeconfig --name diet-app-cluster --region $AWS_REGION
+      - sed -i "s|\${ECR_REPO_URL}|$ECR_REPO_URL|g" infrastructure/frontend/deployment.yaml
+      - kubectl apply -f infrastructure/namespace.yaml
+      - kubectl apply -f infrastructure/frontend/deployment.yaml
+      - kubectl apply -f infrastructure/frontend/service.yaml
+      - kubectl apply -f infrastructure/ingress.yaml
+
+# cicd/buildspec-backend.yml
+version: 0.2
+
+phases:
+  pre_build:
+    commands:
+      - echo Logging in to Amazon ECR...
+      - aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REPO_URL
+      - COMMIT_HASH=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7)
+      - IMAGE_TAG=${COMMIT_HASH:=latest}
+  build:
+    commands:
+      - echo Building the Docker image...
+      - cd backend
+      - docker build -t $ECR_REPO_URL/diet-app-backend:$IMAGE_TAG -t $ECR_REPO_URL/diet-app-backend:latest .
+  post_build:
+    commands:
+      - echo Pushing the Docker image...
+      - docker push $ECR_REPO_URL/diet-app-backend:$IMAGE_TAG
+      - docker push $ECR_REPO_URL/diet-app-backend:latest
+      - echo Writing image definition file...
+      - cd ..
+      - aws eks update-kubeconfig --name diet-app-cluster --region $AWS_REGION
+      - sed -i "s|\${ECR_REPO_URL}|$ECR_REPO_URL|g" infrastructure/backend/deployment.yaml
+      - kubectl apply -f infrastructure/namespace.yaml
+      - kubectl apply -f infrastructure/mongodb/secret.yaml
+      - kubectl apply -f infrastructure/mongodb/deployment.yaml
+      - kubectl apply -f infrastructure/mongodb/service.yaml
+      - kubectl apply -f infrastructure/backend/secret.yaml
+      - kubectl apply -f infrastructure/backend/deployment.yaml
+      - kubectl apply -f infrastructure/backend/service.yaml
+      - kubectl apply -f infrastructure/ingress.yaml
+
+# cicd/codepipeline.yml (AWS CloudFormation 템플릿)
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CI/CD Pipeline for Diet Management App'
+
+Parameters:
+  RepositoryName:
+    Type: String
+    Default: diet-app
+    Description: Name of the CodeCommit repository
+
+  BranchName:
+    Type: String
+    Default: main
+    Description: Name of the branch
+
+Resources:
+  # CodeCommit Repository
+  CodeRepository:
+    Type: AWS::CodeCommit::Repository
+    Properties:
+      RepositoryName: !Ref RepositoryName
+      RepositoryDescription: 'Diet Management App Repository'
+
+  # ECR Repository - Frontend
+  FrontendECRRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: diet-app-frontend
+      ImageScanningConfiguration:
+        ScanOnPush: true
+
+  # ECR Repository - Backend
+  BackendECRRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: diet-app-backend
+      ImageScanningConfiguration:
+        ScanOnPush: true
+
+  # CodeBuild Service Role
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/AmazonECR-FullAccess'
+        - 'arn:aws:iam::aws:policy/AmazonEKSClusterPolicy'
+
+  # CodeBuild Policy
+  CodeBuildPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: CodeBuildPolicy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'logs:CreateLogGroup'
+              - 'logs:CreateLogStream'
+              - 'logs:PutLogEvents'
+            Resource: '*'
+          - Effect: Allow
+            Action:
+              - 'eks:DescribeCluster'
+              - 'eks:ListClusters'
+              - 'eks:UpdateClusterConfig'
+              - 'eks:DescribeUpdate'
+            Resource: '*'
+          - Effect: Allow
+            Action:
+              - 'ecr:GetAuthorizationToken'
+              - 'ecr:BatchCheckLayerAvailability'
+              - 'ecr:GetDownloadUrlForLayer'
+              - 'ecr:GetRepositoryPolicy'
+              - 'ecr:DescribeRepositories'
+              - 'ecr:ListImages'
+              - 'ecr:DescribeImages'
+              - 'ecr:BatchGetImage'
+              - 'ecr:InitiateLayerUpload'
+              - 'ecr:UploadLayerPart'
+              - 'ecr:CompleteLayerUpload'
+              - 'ecr:PutImage'
+            Resource: '*'
+      Roles:
+        - !Ref CodeBuildServiceRole
+
+  # CodeBuild Project - Frontend
+  FrontendBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${RepositoryName}-frontend-build
+      Description: 'Build and deploy frontend to EKS'
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:3.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: ECR_REPO_URL
+            Value: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/diet-app-frontend
+          - Name: AWS_REGION
+            Value: !Ref AWS::Region
+      Source:
+        Type: CODECOMMIT
+        Location: !GetAtt CodeRepository.CloneUrlHttp
+        BuildSpec: cicd/buildspec-frontend.yml
+      TimeoutInMinutes: 15
+
+  # CodeBuild Project - Backend
+  BackendBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${RepositoryName}-backend-build
+      Description: 'Build and deploy backend to EKS'
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:3.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: ECR_REPO_URL
+            Value: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/diet-app-backend
+          - Name: AWS_REGION
+            Value: !Ref AWS::Region
+      Source:
+        Type: CODECOMMIT
+        Location: !GetAtt CodeRepository.CloneUrlHttp
+        BuildSpec: cicd/buildspec-backend.yml
+      TimeoutInMinutes: 15
+
+  # CodePipeline Service Role
+  CodePipelineServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/AWSCodeBuildAdminAccess'
+        - 'arn:aws:iam::aws:policy/AWSCodeStarFullAccess'
+
+  # CodePipeline
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      RoleArn: !GetAtt CodePipelineServiceRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: Source
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Version: 1
+                Provider: CodeCommit
+              Configuration:
+                RepositoryName: !Ref RepositoryName
+                BranchName: !Ref BranchName
+              OutputArtifacts:
+                - Name: SourceCode
+        - Name: BuildAndDeploy
+          Actions:
+            - Name: BuildFrontend
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Version: 1
+                Provider: CodeBuild
+              Configuration:
+                ProjectName: !Ref FrontendBuildProject
+              InputArtifacts:
+                - Name: SourceCode
+              RunOrder: 1
+            - Name: BuildBackend
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Version: 1
+                Provider: CodeBuild
+              Configuration:
+                ProjectName: !Ref BackendBuildProject
+              InputArtifacts:
+                - Name: SourceCode
+              RunOrder: 2
+
+  # S3 Bucket for Artifacts
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Status: Enabled
+            ExpirationInDays: 30
+
+  # Bucket Policy
+  ArtifactBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ArtifactBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyUnEncryptedObjectUploads
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:PutObject'
+            Resource: !Sub ${ArtifactBucket.Arn}/*
+            Condition:
+              StringNotEquals:
+                's3:x-amz-server-side-encryption': 'aws:kms'
+
+Outputs:
+  CodeCommitRepositoryURL:
+    Description: 'CodeCommit Repository URL'
+    Value: !GetAtt CodeRepository.CloneUrlHttp
+
+  FrontendECRRepositoryURL:
+    Description: 'Frontend ECR Repository URL'
+    Value: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${FrontendECRRepository}
+
+  BackendECRRepositoryURL:
+    Description: 'Backend ECR Repository URL'
+    Value: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${BackendECRRepository}
+
+  PipelineName:
+    Description: 'CodePipeline Name'
+    Value: !Ref Pipeline

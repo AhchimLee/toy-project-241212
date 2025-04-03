@@ -1,0 +1,233 @@
+# infrastructure/mongodb/deployment.yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mongodb
+  namespace: diet-app
+spec:
+  serviceName: mongodb
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mongodb
+  template:
+    metadata:
+      labels:
+        app: mongodb
+    spec:
+      containers:
+      - name: mongodb
+        image: mongo:5.0
+        ports:
+        - containerPort: 27017
+        env:
+        - name: MONGO_INITDB_ROOT_USERNAME
+          valueFrom:
+            secretKeyRef:
+              name: mongodb-secret
+              key: username
+        - name: MONGO_INITDB_ROOT_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: mongodb-secret
+              key: password
+        volumeMounts:
+        - name: mongodb-data
+          mountPath: /data/db
+  volumeClaimTemplates:
+  - metadata:
+      name: mongodb-data
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      storageClassName: gp2
+      resources:
+        requests:
+          storage: 10Gi
+
+---
+# infrastructure/mongodb/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: mongodb
+  namespace: diet-app
+spec:
+  selector:
+    app: mongodb
+  ports:
+  - port: 27017
+    targetPort: 27017
+  clusterIP: None
+
+---
+# infrastructure/mongodb/secret.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mongodb-secret
+  namespace: diet-app
+type: Opaque
+data:
+  username: YWRtaW4=  # base64로 인코딩된 "admin"
+  password: cGFzc3dvcmQ=  # base64로 인코딩된 "password"
+
+---
+# infrastructure/backend/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  namespace: diet-app
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: backend
+  template:
+    metadata:
+      labels:
+        app: backend
+    spec:
+      containers:
+      - name: backend
+        image: ${ECR_REPO_URL}/diet-app-backend:latest
+        ports:
+        - containerPort: 5000
+        env:
+        - name: PORT
+          value: "5000"
+        - name: MONGODB_URI
+          value: "mongodb://admin:password@mongodb.diet-app.svc.cluster.local:27017/diet-app?authSource=admin"
+        - name: JWT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: backend-secret
+              key: jwt-secret
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 5000
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 5000
+          initialDelaySeconds: 15
+          periodSeconds: 20
+
+---
+# infrastructure/backend/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend
+  namespace: diet-app
+spec:
+  selector:
+    app: backend
+  ports:
+  - port: 80
+    targetPort: 5000
+  type: ClusterIP
+
+---
+# infrastructure/backend/secret.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: backend-secret
+  namespace: diet-app
+type: Opaque
+data:
+  jwt-secret: c29tZXN1cGVyc2VjcmV0and0c2VjcmV0a2V5  # base64로 인코딩된 JWT 시크릿 키
+
+---
+# infrastructure/frontend/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: diet-app
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: frontend
+  template:
+    metadata:
+      labels:
+        app: frontend
+    spec:
+      containers:
+      - name: frontend
+        image: ${ECR_REPO_URL}/diet-app-frontend:latest
+        ports:
+        - containerPort: 3000
+        env:
+        - name: NEXT_PUBLIC_BACKEND_URL
+          value: "http://backend.diet-app.svc.cluster.local"
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 3000
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 3000
+          initialDelaySeconds: 15
+          periodSeconds: 20
+
+---
+# infrastructure/frontend/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  namespace: diet-app
+spec:
+  selector:
+    app: frontend
+  ports:
+  - port: 80
+    targetPort: 3000
+  type: ClusterIP
+
+---
+# infrastructure/ingress.yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: diet-app-ingress
+  namespace: diet-app
+  annotations:
+    kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+spec:
+  rules:
+  - http:
+      paths:
+      - path: /api
+        pathType: Prefix
+        backend:
+          service:
+            name: backend
+            port:
+              number: 80
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: frontend
+            port:
+              number: 80
+
+---
+# infrastructure/namespace.yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: diet-app
